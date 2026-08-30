@@ -4,7 +4,7 @@ import sys
 import time
 from datetime import timedelta
 from html import escape
-from urllib.parse import unquote, quote
+from urllib.parse import quote, unquote, urlsplit
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -140,6 +140,8 @@ def _controller_v1_handler(req: V1RequestBase) -> V1ResponseBase:
         res = _cmd_request_get(req)
     elif req.cmd == 'request.post':
         res = _cmd_request_post(req)
+    elif req.cmd == 'request.download':
+        res = _cmd_request_download(req)
     else:
         raise Exception(f"Request parameter 'cmd' = '{req.cmd}' is invalid.")
 
@@ -158,6 +160,20 @@ def _cmd_request_get(req: V1RequestBase) -> V1ResponseBase:
         logging.warning("Request parameter 'download' was removed in FlareSolverr v2.")
 
     challenge_res = _resolve_challenge(req, 'GET')
+    res = V1ResponseBase({})
+    res.status = challenge_res.status
+    res.message = challenge_res.message
+    res.solution = challenge_res.result
+    return res
+
+
+def _cmd_request_download(req: V1RequestBase) -> V1ResponseBase:
+    if req.url is None:
+        raise Exception(
+            "Request parameter 'url' is mandatory in 'request.download' command."
+        )
+
+    challenge_res = _resolve_challenge(req, 'DOWNLOAD')
     res = V1ResponseBase({})
     res.status = challenge_res.status
     res.message = challenge_res.message
@@ -369,15 +385,22 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
             # if CDP commands are not available or fail, ignore and continue
             logging.debug("Network.setBlockedURLs failed or unsupported on this webdriver")
 
-    # navigate to the page
-    logging.debug(f"Navigating to... {req.url}")
+    # For downloads, first establish an HTML page on the same origin. Navigating
+    # directly to the target would make Chrome download the file before Selenium
+    # can return its bytes.
+    navigation_url = req.url
+    if method == 'DOWNLOAD':
+        parsed_url = urlsplit(req.url)
+        navigation_url = f'{parsed_url.scheme}://{parsed_url.netloc}/'
+
+    logging.debug(f"Navigating to... {navigation_url}")
     turnstile_token = None
 
     if method == "POST":
         _post_request(req, driver)
     else:
         if req.tabs_till_verify is None:
-            driver.get(req.url)
+            driver.get(navigation_url)
         else:
             turnstile_token = _resolve_turnstile_captcha(req, driver)
 
@@ -391,7 +414,7 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
         if method == 'POST':
             _post_request(req, driver)
         else:
-            driver.get(req.url)
+            driver.get(navigation_url)
 
     # wait for the page
     if utils.get_config_log_html():
@@ -475,7 +498,42 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
     challenge_res.userAgent = utils.get_user_agent(driver)
     challenge_res.turnstile_token = turnstile_token
 
-    if not req.returnOnlyCookies:
+    if method == 'DOWNLOAD':
+        driver.set_script_timeout(int(req.maxTimeout) / 1000)
+        download = driver.execute_async_script(
+            """
+            const url = arguments[0];
+            const done = arguments[arguments.length - 1];
+            fetch(url, {credentials: 'include'})
+                .then(async response => {
+                    const bytes = new Uint8Array(await response.arrayBuffer());
+                    let binary = '';
+                    const chunkSize = 32768;
+                    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                        binary += String.fromCharCode(
+                            ...bytes.subarray(offset, offset + chunkSize)
+                        );
+                    }
+                    done({
+                        status: response.status,
+                        url: response.url,
+                        contentType: response.headers.get('content-type'),
+                        response: btoa(binary),
+                    });
+                })
+                .catch(error => done({error: String(error)}));
+            """,
+            req.url,
+        )
+        if download.get('error'):
+            raise Exception('Download failed: ' + download['error'])
+        challenge_res.url = download['url']
+        challenge_res.status = download['status']
+        challenge_res.headers = {
+            'Content-Type': download.get('contentType') or 'application/octet-stream'
+        }
+        challenge_res.response = download['response']
+    elif not req.returnOnlyCookies:
         challenge_res.headers = {}  # todo: fix, selenium not provides this info
 
         if req.waitInSeconds and req.waitInSeconds > 0:
